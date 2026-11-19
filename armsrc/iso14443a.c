@@ -1322,6 +1322,28 @@ void iso14a_toggle_pcb_blocknum(void) {
     iso14_pcb_blocknum ^= 1;
 }
 
+// NTAG I2C plus 2K (e.g. Kirby Air Riders amiibo). Selected for sim type 7 when the
+// dump header's GET_VERSION is that of an NTAG I2C plus 2K. Emulator memory then holds
+// both 1 KB sectors (512 pages) after the header; behaviour follows the pixl.js v3
+// amiibo emulator (solosky/pixl.js PR #381), which works with a Switch 2.
+#define NTAG_I2C_2K_PAGES           512
+#define NTAG_I2C_NS_REG_PAGE        0xED    // session register NS_REG, byte 2
+#define NTAG_I2C_SRAM_RF_READY      0x08
+static const uint8_t ntag_i2c_plus_2k_version[8] = {0x00, 0x04, 0x04, 0x05, 0x02, 0x02, 0x15, 0x03};
+
+static bool mfu_header_is_ntag_i2c_2k(void) {
+    const mfu_dump_t *hdr = (const mfu_dump_t *) BigBuf_get_EM_addr();
+    return memcmp(hdr->version, ntag_i2c_plus_2k_version, sizeof(ntag_i2c_plus_2k_version)) == 0;
+}
+
+// Set NS_REG.SRAM_RF_READY in data read from pages [first, first + n) of sector 0.
+// The Switch 2 polls this bit and only then reads the SRAM (pages 0xF0-0xFF).
+static void ntag_i2c_mark_sram_ready(uint8_t *data, uint16_t first, uint16_t n) {
+    if (first <= NTAG_I2C_NS_REG_PAGE && NTAG_I2C_NS_REG_PAGE < first + n) {
+        data[(NTAG_I2C_NS_REG_PAGE - first) * 4 + 2] |= NTAG_I2C_SRAM_RF_READY;
+    }
+}
+
 bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data,
                            uint8_t *ats, size_t ats_len,
                            tag_response_info_t **responses,
@@ -1674,7 +1696,9 @@ bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data,
     // password and its PACK (0x8080) at the PWD/PACK pages, so the sim serves them from
     // emulator memory like any other value. Auth and PACK are then read straight from
     // memory, keeping eset/eview authoritative (what you set is what the sim serves).
-    if (tagType == 7) {
+    // Not for NTAG I2C plus: its PWD/PACK live at pages 0xE5/0xE6, and the last
+    // pages are the SRAM, which must not be overwritten.
+    if (tagType == 7 && mfu_header_is_ntag_i2c_2k() == false) {
         uint8_t pwd[4] = {0, 0, 0, 0};
         emlGet(pwd, (*pages - 1) * 4 + MFU_DUMP_PREFIX_LENGTH, sizeof(pwd));
         if (memcmp(pwd, "\x00\x00\x00\x00", 4) == 0) {
@@ -1912,6 +1936,14 @@ void SimulateIso14443aTagEx(uint8_t tagType, uint16_t flags, uint8_t *useruid, u
 
     bool odd_reply = true;
 
+    // NTAG I2C plus 2K state
+    const bool ntag_i2c = (tagType == 7) && mfu_header_is_ntag_i2c_2k();
+    uint16_t i2c_sector = 0;
+    bool i2c_selecting_sector = false;
+    if (ntag_i2c) {
+        Dbprintf("Simulating " _YELLOW_("NTAG I2C plus 2K") " (2 sectors, SRAM ready)");
+    }
+
     set_tracing(true);
     LED_A_ON();
 
@@ -1928,6 +1960,94 @@ void SimulateIso14443aTagEx(uint8_t tagType, uint16_t flags, uint8_t *useruid, u
             Dbprintf("Emulator stopped. Trace length: %d ", BigBuf_get_traceLen());
             retval = PM3_EOPABORTED;
             break;
+        }
+
+        // NTAG I2C plus 2K: commands that differ from NTAG215. Everything else
+        // (GET_VERSION, READ_SIG, anticollision, HALT) falls through to the normal handling.
+        if (ntag_i2c) {
+            bool handled = true;
+            tag_response_info_t *i2c_response = NULL;   // sent by the loop, like other replies
+            if (i2c_selecting_sector) {
+                // SECTOR_SELECT part 2: sector + 3 RFU bytes + CRC. A passive ACK means no reply.
+                i2c_selecting_sector = false;
+                if (len == 6 && CheckCrc14A(receivedCmd, len) && receivedCmd[0] < (NTAG_I2C_2K_PAGES / 256)) {
+                    i2c_sector = receivedCmd[0];
+                } else {
+                    EmSend4bit(CARD_NACK_IV);
+                }
+            } else if (receivedCmd[0] == NTAG_I2C_SELECT_SECTOR && len == 4 && receivedCmd[1] == 0xFF) {
+                // SECTOR_SELECT part 1
+                i2c_selecting_sector = true;
+                EmSend4bit(CARD_ACK);
+            } else if (receivedCmd[0] == ISO14443A_CMD_READBLOCK && len == 4) {
+                uint16_t page = (i2c_sector * 256) + receivedCmd[1];
+                if (page + 4 > NTAG_I2C_2K_PAGES) {
+                    EmSend4bit(CARD_NACK_IV);
+                } else {
+                    uint8_t emdata[MIFARE_BLOCK_SIZE + CRC16_SIZE] = {0};
+                    emlGet(emdata, MFU_DUMP_PREFIX_LENGTH + page * 4, MIFARE_BLOCK_SIZE);
+                    if (i2c_sector == 0) {
+                        ntag_i2c_mark_sram_ready(emdata, page, 4);
+                    }
+                    AddCrc14A(emdata, MIFARE_BLOCK_SIZE);
+                    EmSendCmd(emdata, sizeof(emdata));
+                    numReads++;
+                    if (exitAfterNReads > 0 && numReads == exitAfterNReads) {
+                        Dbprintf("[MFUEMUL_WORK] " _YELLOW_("%u") " reads done, exiting", numReads);
+                        finished = true;
+                    }
+                }
+            } else if (receivedCmd[0] == MIFARE_ULEV1_FASTREAD && len == 5) {
+                uint16_t first = (i2c_sector * 256) + receivedCmd[1];
+                uint16_t last = (i2c_sector * 256) + receivedCmd[2];
+                uint16_t n = (last >= first) ? (last - first + 1) : 0;
+                if (n == 0 || last >= NTAG_I2C_2K_PAGES || (n * 4) + CRC16_SIZE > MAX_FRAME_SIZE) {
+                    EmSend4bit(CARD_NACK_IV);
+                } else {
+                    uint8_t emdata[MAX_FRAME_SIZE] = {0};
+                    emlGet(emdata, MFU_DUMP_PREFIX_LENGTH + first * 4, n * 4);
+                    if (i2c_sector == 0) {
+                        ntag_i2c_mark_sram_ready(emdata, first, n);
+                    }
+                    AddCrc14A(emdata, n * 4);
+                    EmSendCmd(emdata, (n * 4) + CRC16_SIZE);
+                }
+            } else if (receivedCmd[0] == MIFARE_ULC_WRITE && len == 8) {
+                uint16_t page = (i2c_sector * 256) + receivedCmd[1];
+                if (CheckCrc14A(receivedCmd, len) == false) {
+                    EmSend4bit(CARD_NACK_PA);
+                } else if (page >= NTAG_I2C_2K_PAGES || page < 2) {
+                    EmSend4bit(CARD_NACK_IV);
+                } else if (page == 2) {
+                    // only the static lock bytes are writable on page 2
+                    uint8_t blk[4] = {0};
+                    emlGet(blk, MFU_DUMP_PREFIX_LENGTH + 8, 4);
+                    blk[2] = receivedCmd[4];
+                    blk[3] = receivedCmd[5];
+                    emlSet(blk, MFU_DUMP_PREFIX_LENGTH + 8, 4);
+                    EmSend4bit(CARD_ACK);
+                } else {
+                    emlSet(&receivedCmd[2], MFU_DUMP_PREFIX_LENGTH + page * 4, 4);
+                    EmSend4bit(CARD_ACK);
+                }
+            } else if (receivedCmd[0] == NTAG_I2C_FASTWRITE && len >= 5) {
+                // FAST_WRITE fills the SRAM for the I2C side; nothing listens there, just ACK
+                EmSend4bit(CARD_ACK);
+            } else if (receivedCmd[0] == MIFARE_ULEV1_AUTH && len == 7) {
+                // accept any password, like the pixl.js emulator; PACK 0x8080
+                dynamic_response_info.response[0] = 0x80;
+                dynamic_response_info.response[1] = 0x80;
+                AddCrc14A(dynamic_response_info.response, 2);
+                dynamic_response_info.response_n = 4;
+                prepare_tag_modulation(&dynamic_response_info, dynamic_modulation_buffer_size);
+                i2c_response = &dynamic_response_info;
+            } else {
+                handled = false;
+            }
+            if (handled) {
+                p_response = i2c_response;
+                goto jump;
+            }
         }
 
         // we need to check "ordered" states before, because received data may be same to any command - is wrong!!!
