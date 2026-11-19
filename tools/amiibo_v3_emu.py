@@ -12,7 +12,7 @@ page 254, and these tags have 512 pages).
 
 then in the Proxmark3 client:
 
-    hf mf eload --4k -f kirby.eml.bin
+    hf mf eload --4k -q 132 -f kirby.eml.bin
     hf mfu sim -t 7 -u <uid printed by this script>
 """
 
@@ -72,7 +72,8 @@ def main() -> int:
     a.out.write_bytes(build(image))
     uid = image[:7].hex().upper()        # no BCC bytes on NTAG I2C: page 0-1 hold the UID as is
     print(f"wrote {a.out} ({a.out.stat().st_size} bytes), amiibo id {image[0x54:0x5C].hex()}")
-    print(f"  hf mf eload --4k -f {a.out}")
+    blocks = a.out.stat().st_size // 16       # -q: the file is smaller than a 4K card
+    print(f"  hf mf eload --4k -q {blocks} -f {a.out}")
     print(f"  hf mfu sim -t 7 -u {uid}")
     return 0
 
